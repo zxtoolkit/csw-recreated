@@ -11,8 +11,8 @@ const BULLET_CP437: u8 = 0xFE;
 /// The same glyph as [`BULLET_CP437`], encoded for a terminal that reads UTF-8.
 const BULLET_CP437_AS_UTF8: &[u8] = "\u{25A0}".as_bytes();
 
-/// The banner. Fixed text: it identifies the format version, not the build.
-const BANNER: &[u8] = b"\n-=[ CSW v2.00 ]=-  Ramsoft's CSW converter, recreated (GPL v2.0+).\n\n";
+/// The banner, byte for byte, copyright line included.
+const BANNER: &[u8] = b"\n-=[ CSW v2.00 ]=-  (C) 1998-2003 Ramsoft, a ZX Spectrum demogroup.\n\n";
 
 /// The help screen. Fixed text, and complete: the switches it lists are the
 /// switches there are, so anything else is an invalid switch.
@@ -554,7 +554,7 @@ mod tests {
         assert!(!v.contains(&b'\xFE'));
         assert_eq!(
             BANNER,
-            &b"\n-=[ CSW v2.00 ]=-  Ramsoft's CSW converter, recreated (GPL v2.0+).\n\n"[..]
+            &b"\n-=[ CSW v2.00 ]=-  (C) 1998-2003 Ramsoft, a ZX Spectrum demogroup.\n\n"[..]
         );
         assert!(HELP_HEAD.windows(2).any(|w| w == b"\n\n"));
         assert!(HELP_TAIL.ends_with(b"manual.\n"));

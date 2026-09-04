@@ -119,12 +119,12 @@ The CSW format was designed by Ramsoft, whose MS-DOS converter established
 the conversion workflow this tool follows. This is an independent
 implementation, not affiliated with or endorsed by them.
 
-The `CSW v2.00` stamp written into a CSW v2 header is that program's own
-text, reproduced verbatim so that files can be compared byte-for-byte. The
-banner — `-=[ CSW v2.00 ]=-  Ramsoft's CSW converter, recreated (GPL v2.0+).`
-— is this tool's own, keeping the shape of the line it replaces. Neither is a
-claim of authorship or a trade mark, and if Ramsoft would prefer not to be
-named, the references will be removed on request.
+The banner this tool prints, and the `CSW v2.00` stamp it writes into a CSW
+v2 header, are that program's own text, reproduced verbatim so that console
+output and written files can be compared byte-for-byte against it. The
+copyright the banner states is Ramsoft's, left intact for that reason.
+Neither is a claim of authorship or a trade mark, and if Ramsoft would prefer
+that this tool not reproduce them, they will be removed on request.
 
 ## License
 
