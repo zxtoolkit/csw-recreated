@@ -4,16 +4,28 @@ version = "2.0.0"
 edition = "2024"
 rust-version = "1.87"
 license = "GPL-2.0-or-later"
-description = "Compressed Square Wave (CSW) tape-image converter: WAV/VOC/IFF/8SVX/OUT to CSW, and CSW back to WAV or VOC"
+description = "Compressed Square Wave (CSW) tape-image converter: WAV/VOC/IFF/8SVX/OUT to CSW, CSW back to WAV or VOC, and recording from a soundcard input"
 
 [features]
-default = ["zlib-c"]
+default = ["record", "zlib-c"]
+# DirectMode (-r) with the portable backend: cpal, over CoreAudio / WASAPI /
+# ALSA. On by default; disable it to build with no audio stack present (e.g. a
+# Linux box without ALSA headers):  cargo build --no-default-features
+record = ["directmode", "dep:cpal"]
+# DirectMode (-r) with the raw-ALSA backend: the kernel's PCM ioctls direct,
+# no libasound to build against or ship. Linux only, and what a fully static
+# musl binary needs. Selected over cpal wherever it can run, so a build with
+# both features records through raw ALSA on Linux and through cpal elsewhere.
+record-alsa = ["directmode"]
+# Everything DirectMode needs that is not a backend: raw-mode keys, and the
+# free space on the volume it is written to. Enabled by the two features
+# above; on its own it fails the build, because there would be nothing to
+# record with.
+directmode = ["dep:crossterm", "dep:libc", "dep:windows-sys"]
 # The Z-RLE writer's deflate: zlib's own, in C, vendored (see the dependency
-# note below). Off, the crate needs no C compiler; it reads both compressions
-# and writes `-z` and `-1`, and refuses the default Z-RLE output. On by
-# default, so a build that drops the default features and writes that output
-# names it:
-#   cargo build --release --no-default-features --features zlib-c
+# note below). Off, the crate needs no C compiler; it reads both compressions,
+# writes the plain-RLE and v1.01 outputs, and refuses the default Z-RLE one. A
+# build that drops the default features and writes that output names it again.
 zlib-c = ["dep:libz-sys", "flate2/zlib"]
 
 [dependencies]
@@ -31,9 +43,37 @@ flate2 = { version = "1.1", default-features = false, features = [
 libz-sys = { version = "1", default-features = false, features = [
     "static",
 ], optional = true }
+# DirectMode only: host audio capture.
+# The licence consequence: cpal is Apache-2.0 only, which GPL-3 admits and
+# GPL-2 does not, so a binary built with the default `record` feature is
+# distributable under GPL-3 (which "or later" permits) and not under GPL-2.
+# README.md's License section is the long form.
+cpal = { version = "0.18", optional = true }
+
+# DirectMode only; on Unix libc is nearly all DirectMode needs: the terminal
+# (raw mode, one keypress, the window width) in src/term.rs, the free space
+# bounding a recording on the volume it is written to, and the raw-ALSA
+# backend's ioctls.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Storage_FileSystem",
+], optional = true }
+# Windows console input is an API rather than a byte stream, so this platform
+# keeps crossterm where Unix does the three system calls itself (src/term.rs).
+crossterm = { version = "0.29", default-features = false, features = [
+    "events",
+    "windows",
+], optional = true }
+
 [profile.release]
 opt-level = 3
 lto = true
-# Unwind tables and landing pads dropped: no Drop runs on the way out of a
-# panic. Nothing here calls catch_unwind.
+# Unwind tables and landing pads dropped. WHAT IT COSTS is Drop on the way out
+# of a panic, and this crate has two that do work: TempPath in spool.rs
+# unlinks the recording spool, and Keyboard in record.rs restores the terminal
+# from raw mode. A panic during DirectMode strands a .csw-spool-*.tmp and
+# leaves the terminal raw. Nothing here calls catch_unwind.
 panic = "abort"

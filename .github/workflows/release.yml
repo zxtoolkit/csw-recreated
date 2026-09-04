@@ -1,8 +1,8 @@
 name: release
 
-# WHAT THIS SHIPS: one archive per platform -- Windows, a universal macOS
-# build, and Linux x86_64 and aarch64 -- each holding a self-contained binary
-# with csw.html and wave.gif. Nothing here is
+# WHAT THIS SHIPS: six archives -- Windows, a universal macOS build, and a
+# static and a -glibc build for each of Linux x86_64 and aarch64 -- each
+# holding a self-contained binary with csw.html and wave.gif. Nothing here is
 # an installer or a package -- the audience for a tape converter is someone
 # who wants the file next to the tape deck to just run, on whatever machine
 # is next to the tape deck.
@@ -46,11 +46,35 @@ env:
   RUSTFLAGS: -C strip=symbols
 
 jobs:
+  # TWO BINARIES FROM ONE JOB, because Linux has two answers to "where does
+  # the audio come from" and they want different builds:
+  #
+  #   csw-linux-*         musl, --features record-alsa. Zero dependencies of
+  #                       any kind, runs on anything with a matching kernel,
+  #                       and records: DirectMode drives the kernel's PCM
+  #                       ioctls itself, opening the card exclusively at its
+  #                       own rate with nothing resampling in between.
+  #   csw-linux-*-glibc   glibc >= 2.35 with ALSA present. DirectMode goes
+  #                       through cpal and libasound.so.2 instead: the input
+  #                       the desktop calls default, by way of whatever
+  #                       PipeWire or PulseAudio is already doing with the
+  #                       card -- which is the only way to record on a machine
+  #                       where a sound server holds it.
+  #
+  # THE UNSUFFIXED NAME IS THE MUSL BUILD: the one that installs nothing and
+  # records, for the Pi or the headless box next to the tape deck. A glibc
+  # binary on Alpine or an old distro does not execute at all; the musl binary
+  # on a desktop converts files and refuses only `-r`, with an error that
+  # names the fix. Download URLs depend on the names, so they do not change.
   linux:
     name: linux-x86_64
-    # PINNED, deliberately not `ubuntu-latest`, so that this job and its
-    # aarch64 twin below sit on the same image and only their architecture
-    # differs.
+    # PINNED, deliberately not `ubuntu-latest`. The runner's glibc becomes the
+    # FLOOR of the glibc binary this job ships, and `ubuntu-latest` is 24.04:
+    # that binary needs glibc >= 2.39 and does not start on Debian 12 or
+    # Ubuntu 22.04. 22.04 drops the floor to 2.35 and costs the build nothing.
+    # Raising this label raises the floor for every user; it is not a routine
+    # bump. WHEN 22.04 IS RETIRED, the answer is a container -- not a newer
+    # label, which is the obvious lever and the wrong one.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -59,26 +83,37 @@ jobs:
           toolchain: stable
           targets: x86_64-unknown-linux-musl
 
-      # The build compiles one thing in C: zlib (libz-sys, vendored, because
-      # the Z-RLE bytes must be zlib's), and C for musl takes a musl C
-      # compiler -- musl-tools' musl-gcc, named to cc-rs through CC_<target>.
-      # That is the whole C toolchain the static build needs; Rust's
-      # self-contained musl linking does the rest.
-      - name: Install the musl C compiler
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # cpal needs ALSA's headers to build the DirectMode (-r) backend; only
+      # the glibc build compiles it. The musl build compiles one thing in C:
+      # zlib (libz-sys, vendored, because the Z-RLE bytes must be zlib's), and
+      # C for musl takes a musl C compiler -- musl-tools' musl-gcc, named to
+      # cc-rs through CC_<target>. --no-default-features drops cpal and
+      # record-alsa is ioctl calls, so that is the whole C toolchain the
+      # static build needs; Rust's self-contained musl linking does the rest.
+      # `zlib-c` is named alongside record-alsa because --no-default-features
+      # drops it too, and the release assets write Z-RLE.
+      - name: Install ALSA development headers and the musl C compiler
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev musl-tools
 
-      - name: Build (static musl)
+      - name: Build (glibc, DirectMode)
+        run: cargo build --release --locked
+
+      - name: Build (static musl, DirectMode over raw ALSA)
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --locked
+        run: cargo build --release --locked --no-default-features
+             --features record-alsa,zlib-c
              --target x86_64-unknown-linux-musl
 
       - name: Stage and check
         run: |
           set -eu
           mkdir -p dist
+          cp target/release/csw dist/csw-linux-x86_64-glibc
           cp target/x86_64-unknown-linux-musl/release/csw dist/csw-linux-x86_64
           chmod +x dist/*
+          echo "--- glibc build, what it needs at runtime ---"
+          ldd dist/csw-linux-x86_64-glibc
           echo "--- static build, which must need nothing ---"
           file dist/csw-linux-x86_64
           # readelf, not ldd: a static-pie binary makes ldd print "statically
@@ -91,18 +126,23 @@ jobs:
           fi
           echo "no NEEDED entries"
 
+      # Both binaries convert, and both hashes go into the comparison: two
+      # different feature sets and two different libcs must produce the same
+      # bytes, and nothing else would notice if they did not.
       - name: Convert the reference fixtures
         run: |
           set -eu
-          b=dist/csw-linux-x86_64
-          "./$b" fixtures/tone-8bit.wav tone.csw
-          "./$b" fixtures/square-8bit.wav square.csw
-          sha256sum tone.csw square.csw | tee "sha-$(basename "$b").txt"
+          for b in dist/csw-linux-x86_64-glibc dist/csw-linux-x86_64; do
+            "./$b" fixtures/tone-8bit.wav tone.csw
+            "./$b" fixtures/square-8bit.wav square.csw
+            sha256sum tone.csw square.csw | tee -a "sha-$(basename "$b").txt"
+          done
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: csw-linux-x86_64
           path: |
+            dist/csw-linux-x86_64-glibc
             dist/csw-linux-x86_64
             sha-*.txt
 
@@ -111,7 +151,7 @@ jobs:
   # it is half the Linux audience. Otherwise this is the job above with its
   # labels changed, on purpose: identical build commands mean a disagreement
   # between the two binaries can never be blamed on the flags.
-  #   Pinned for the same reason its x86 twin is.
+  #   Pinned to 22.04 for the same reason its x86 twin is.
   linux-arm:
     name: linux-aarch64
     runs-on: ubuntu-22.04-arm
@@ -123,21 +163,28 @@ jobs:
           targets: aarch64-unknown-linux-musl
 
       # As above: this runner is aarch64, so musl-tools' musl-gcc targets it.
-      - name: Install the musl C compiler
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install ALSA development headers and the musl C compiler
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev musl-tools
 
-      - name: Build (static musl)
+      - name: Build (glibc, DirectMode)
+        run: cargo build --release --locked
+
+      - name: Build (static musl, DirectMode over raw ALSA)
         env:
           CC_aarch64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --locked
+        run: cargo build --release --locked --no-default-features
+             --features record-alsa,zlib-c
              --target aarch64-unknown-linux-musl
 
       - name: Stage and check
         run: |
           set -eu
           mkdir -p dist
+          cp target/release/csw dist/csw-linux-aarch64-glibc
           cp target/aarch64-unknown-linux-musl/release/csw dist/csw-linux-aarch64
           chmod +x dist/*
+          echo "--- glibc build, what it needs at runtime ---"
+          ldd dist/csw-linux-aarch64-glibc
           echo "--- static build, which must need nothing ---"
           file dist/csw-linux-aarch64
           if readelf -d dist/csw-linux-aarch64 | grep -q NEEDED; then
@@ -150,22 +197,25 @@ jobs:
       - name: Convert the reference fixtures
         run: |
           set -eu
-          b=dist/csw-linux-aarch64
-          "./$b" fixtures/tone-8bit.wav tone.csw
-          "./$b" fixtures/square-8bit.wav square.csw
-          sha256sum tone.csw square.csw | tee "sha-$(basename "$b").txt"
+          for b in dist/csw-linux-aarch64-glibc dist/csw-linux-aarch64; do
+            "./$b" fixtures/tone-8bit.wav tone.csw
+            "./$b" fixtures/square-8bit.wav square.csw
+            sha256sum tone.csw square.csw | tee -a "sha-$(basename "$b").txt"
+          done
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: csw-linux-aarch64
           path: |
+            dist/csw-linux-aarch64-glibc
             dist/csw-linux-aarch64
             sha-*.txt
 
   # ONE FILE FOR BOTH MACS. Intel and Apple Silicon in a single universal
   # binary, so there is no architecture to pick on the download page -- the
   # place a legacy audience most reliably picks wrong. macOS needs no static
-  # question: everything this binary calls is in the system.
+  # question: CoreAudio is a system framework, present on every Mac, and cpal
+  # talks to it directly rather than through anything installable.
   macos:
     name: macos-universal
     runs-on: macos-latest
@@ -178,7 +228,8 @@ jobs:
 
       # The deployment target is left at rustc's own default for each target
       # (10.12 on x86_64), which is already older than any Mac likely to be
-      # running this.
+      # running this. Forcing it lower would mean fighting the SDK cpal's
+      # CoreAudio bindings are generated against, for no reachable user.
       - name: Build both slices
         run: |
           set -eu
@@ -386,7 +437,9 @@ jobs:
           pack csw-windows-x86_64.exe  csw.exe zip
           pack csw-macos-universal     csw     zip
           pack csw-linux-x86_64        csw     tar
+          pack csw-linux-x86_64-glibc  csw     tar
           pack csw-linux-aarch64       csw     tar
+          pack csw-linux-aarch64-glibc csw     tar
           ls -l pkg
 
       # Three files, the program among them, and no directory to descend into.
@@ -487,6 +540,11 @@ jobs:
              **csw-VERSION-linux-aarch64.tar.gz**)
           2. Extract: `tar xzvf csw-VERSION-linux-x86_64.tar.gz`
           3. Run `./csw`
+
+          The **-glibc** archives are for recording with `-r` on a desktop,
+          where PipeWire or PulseAudio holds the soundcard and only a build
+          that goes through it can record. They need glibc >= 2.35 and ALSA
+          installed. Conversion is the same in both.
           NOTES
           sed -i "s|VERSION|$GITHUB_REF_NAME|g" release-notes.md
 

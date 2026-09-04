@@ -4,3 +4,6 @@
 # Rust build output
 /target
 *.profraw
+
+# A DirectMode spool a crash left behind
+.csw-spool-*.tmp

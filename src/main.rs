@@ -1,12 +1,28 @@
 //! csw -- a converter between sampled tape audio (WAV/VOC/IFF/OUT) and the
 //! CSW (Compressed Square Wave) tape-image format.
 
+#[cfg(feature = "directmode")]
+mod audio;
 mod cli;
+#[cfg(feature = "directmode")]
+mod record;
+#[cfg(feature = "directmode")]
+mod spool;
+#[cfg(feature = "directmode")]
+mod term;
 mod ui;
 
 use std::io::{self, IsTerminal, Write};
 
 use ::csw::convert::{self, DecodeTarget, Report, Settings};
+#[cfg(feature = "directmode")]
+use ::csw::detect;
+#[cfg(feature = "directmode")]
+use ::csw::encode::PulseEncoder;
+#[cfg(feature = "directmode")]
+use ::csw::encode::Rewindable;
+#[cfg(feature = "directmode")]
+use ::csw::wav;
 use ::csw::{container, error, filter};
 use std::path::Path;
 use std::process::ExitCode;
@@ -198,8 +214,9 @@ fn encode(cli: &cli::Cli, ui: &Console, w: &mut impl Write) -> Result<()> {
     // own handle and fails as "Wrong file type".
     let out = output_name(cli.output.as_deref(), &cli.input, "csw");
     let mut out_file = create_output(&out)?;
-    // `-k` on a file conversion names a keep-file from the output: the file
-    // is created here, empty, and then read *as* the input. An empty file carries no signature, so the
+    // `-k` on a file conversion is the DirectMode keep-file reached by a
+    // command line that does no recording: the file is created here, empty,
+    // and then read *as* the input. An empty file carries no signature, so the
     // conversion ends before the "Checking input file" line is opened,
     // whatever the input held -- and `csw tape.wav tape.csw -k` empties
     // tape.wav, the keep-file's name being the input's.
@@ -342,10 +359,105 @@ fn exit_code(e: &Error) -> u8 {
     }
 }
 
+#[cfg(feature = "directmode")]
+fn direct_names(cli: &cli::Cli) -> (Vec<u8>, Vec<u8>, std::path::PathBuf) {
+    let out = output_name(cli.output.as_deref(), &cli.input, "csw");
+    let keep = keep_file_name(&out);
+    let dir = as_path(&out)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+    (out, keep, dir)
+}
+
+/// DirectMode (`-r`): record from the soundcard, then encode what was
+/// captured through the same filter/binarise/write path a file takes.
+#[cfg(feature = "directmode")]
+fn encode_direct(cli: &cli::Cli, ui: &Console, w: &mut impl Write) -> Result<()> {
+    let spec = record::DirectSpec {
+        rate: cli.rate,
+        seconds: cli.record_secs,
+        device_compat: cli.device_compat,
+        keep_samples: cli.keep_samples,
+    };
+    let (out, keep, dir) = direct_names(cli);
+
+    if let Some(filter) = &cli.filter {
+        ui.digital_filter(w, filter)?;
+    }
+    let mut capture = record::capture(&spec, ui, w, &dir)?;
+    if capture.samples.is_empty() {
+        return Err(Error::Fatal("Nothing was recorded".into()));
+    }
+
+    // `-k`: keep the raw samples too.
+    if cli.keep_samples {
+        write_keep_wav(&keep, capture.rate, &mut capture.samples)?;
+        ui.keeping(w, &keep)?;
+    }
+
+    // No original file: the ratio line divides by nothing (see `packed`).
+    let orig_bytes = 0;
+    // Straight from the spool into the encoder: the recording is never held in
+    // memory, at any length, and the spool is what the detector re-reads.
+    let settings = settings(cli);
+    let mut enc = PulseEncoder::new(
+        capture.rate,
+        f64::from(capture.rate),
+        record::MIDPOINT,
+        cli.filter,
+        convert::zrle_output(&settings),
+        false,
+    );
+    enc.run(&mut capture.samples)?;
+    let sig = enc.finish();
+    let mut lines = Lines::new(ui, w);
+    convert::writing_and_working(&settings, &mut lines)?;
+    let mut out_file = create_output(&out)?;
+    convert::write_csw(&sig, orig_bytes, &settings, &mut lines, &mut out_file)
+}
+
+#[cfg(not(feature = "directmode"))]
 fn encode_direct(_cli: &cli::Cli, _ui: &Console, _w: &mut impl Write) -> Result<()> {
     Err(Error::Unsupported(
-        "this build has no soundcard input: it converts files only".into(),
+        "this build has DirectMode disabled (built without the 'record' or 'record-alsa' feature)"
+            .into(),
     ))
+}
+
+/// Write the `-k` keep-file straight from the spool: header first, then the
+/// samples quantised to 8 bits a chunk at a time, so a long recording is never
+/// held in memory to be written.
+#[cfg(feature = "directmode")]
+fn write_keep_wav(path: &[u8], rate: u32, samples: &mut spool::SpoolReader) -> Result<()> {
+    use std::io::Write as _;
+
+    let file = std::fs::File::create(as_path(path))
+        .map_err(|_| Error::Fatal("Could not create output file".into()))?;
+    let mut out = std::io::BufWriter::new(file);
+    let write = |out: &mut std::io::BufWriter<std::fs::File>, bytes: &[u8]| {
+        out.write_all(bytes)
+            .map_err(|_| Error::Fatal("Could not create output file".into()))
+    };
+    let data_len = wav::wav_data_len(samples.len())?;
+    write(&mut out, &wav::wav_header(rate, 1, 8, data_len))?;
+    let mut chunk = Vec::new();
+    while samples.next_chunk(&mut chunk)? {
+        write(&mut out, &detect::to_byte_domain(&chunk, record::MIDPOINT))?;
+    }
+    out.flush()
+        .map_err(|_| Error::Fatal("Could not create output file".into()))
+}
+
+/// DirectMode's source is the spool.
+#[cfg(feature = "directmode")]
+impl Rewindable for spool::SpoolReader {
+    fn rewind(&mut self) -> Result<()> {
+        spool::SpoolReader::rewind(self)
+    }
+    fn next_chunk(&mut self, out: &mut Vec<f64>) -> Result<bool> {
+        spool::SpoolReader::next_chunk(self, out)
+    }
 }
 
 /// The name a decode opens first: a dotless name with ".csw" appended, and
@@ -592,6 +704,49 @@ mod tests {
             "A.B/OUT"
         );
         assert_eq!(name(output_name(None, b"A.B/W8.WAV", "csw")), "A.csw");
+    }
+
+    #[cfg(feature = "directmode")]
+    #[test]
+    fn a_direct_run_derives_its_names_the_way_a_conversion_does() {
+        let direct = |args: &[&str]| {
+            let argv: Vec<std::ffi::OsString> = std::iter::once("-r")
+                .chain(args.iter().copied())
+                .map(Into::into)
+                .collect();
+            let cli = cli::parse(&argv).expect("parse");
+            assert!(cli.direct && !cli.help);
+            let (out, keep, dir) = direct_names(&cli);
+            (name(out), name(keep), dir.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            direct(&["o5"]),
+            ("o5.csw".into(), "o5.wav".into(), ".".into())
+        );
+        assert_eq!(
+            direct(&["tape.csw"]),
+            ("tape.csw".into(), "tape.wav".into(), ".".into())
+        );
+        assert_eq!(
+            direct(&["rec.dat"]),
+            ("rec.csw".into(), "rec.wav".into(), ".".into())
+        );
+        assert_eq!(
+            direct(&["A.B/REC"]),
+            ("A.csw".into(), "A.wav".into(), ".".into())
+        );
+        assert_eq!(
+            direct(&["ignored.wav", "my.tapes/rec.csw"]),
+            (
+                "my.tapes/rec.csw".into(),
+                "my.tapes/rec.wav".into(),
+                "my.tapes".into()
+            )
+        );
+        assert_eq!(
+            direct(&["ignored", "O4.WA"]),
+            ("O4.WA".into(), "O.wav".into(), ".".into())
+        );
     }
 
     /// A name is bytes: one this host cannot read as text keeps every byte

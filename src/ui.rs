@@ -2,6 +2,8 @@
 //! on stdout. A line's prefix, its ending and whether a blank line follows it
 //! are all part of the contract.
 
+#[cfg(feature = "directmode")]
+use ::csw::convert::clock;
 use std::io::{self, Write};
 
 use crate::filter::{Band, Design, FilterSpec};
@@ -33,6 +35,61 @@ Options:\t-d:  Decompress to WAV file. Use -dv to write a VOC file.\n\
 const HELP_TAIL: &[u8] = b"\
 \t\t     3: disable 3DNow! acceleration\n\n\
 For more info, please read the enclosed documentation and MakeTZX's manual.\n";
+
+/// A volume-meter cell: the glyph CP437 0xFE draws. Only ever drawn to a
+/// live terminal (see `record::run_session`).
+#[cfg(feature = "directmode")]
+const CELL: &[u8] = BULLET_CP437_AS_UTF8;
+/// Cells across a meter: one per column of an 80-column terminal.
+#[cfg(feature = "directmode")]
+const METER_CELLS: usize = 80;
+/// Lines the meter block occupies: the prompt, the two bars, and the recording
+/// line.
+#[cfg(feature = "directmode")]
+const METER_LINES: usize = 4;
+/// Columns the readouts need after a bar. Below this much slack the window
+/// gets bars alone.
+#[cfg(feature = "directmode")]
+const LABEL_COLUMNS: usize = 13;
+/// Cells per unit of RMS amplitude in the 8-bit domain -- 80/128, so a
+/// full-scale square wave fills the row.
+#[cfg(feature = "directmode")]
+const CELLS_PER_UNIT: f32 = 0.625;
+/// The meter's text attributes, as the colours the CGA palette gives them:
+/// bright green for the level bar (attribute 0x0A), bright red for the
+/// clipping bar (0x0C), blue for the unfilled remainder of both (0x01).
+#[cfg(feature = "directmode")]
+const LEVEL_COLOUR: &[u8] = b"\x1b[38;2;85;255;85m";
+#[cfg(feature = "directmode")]
+const CLIP_COLOUR: &[u8] = b"\x1b[38;2;255;85;85m";
+#[cfg(feature = "directmode")]
+const EMPTY_COLOUR: &[u8] = b"\x1b[38;2;0;0;170m";
+#[cfg(feature = "directmode")]
+const RESET_COLOUR: &[u8] = b"\x1b[0m";
+/// Erase from the cursor to the end of the line.
+#[cfg(feature = "directmode")]
+const ERASE_LINE: &[u8] = b"\x1b[K";
+/// Back to the first line of the meter block.
+#[cfg(feature = "directmode")]
+const CURSOR_TO_BLOCK_TOP: &[u8] = b"\x1b[3A";
+#[cfg(feature = "directmode")]
+const _: () = assert!(METER_LINES == 4);
+/// Hide and show the cursor, which parks on the first cell of the block
+/// between redraws.
+#[cfg(feature = "directmode")]
+const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
+#[cfg(feature = "directmode")]
+pub const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+/// The meter-phase prompt and the pause notice, drawn as the first line of
+/// the meter block.
+#[cfg(feature = "directmode")]
+pub const PROMPT_START: &str = "* Press any key to start conversion when done with volume meter...";
+#[cfg(feature = "directmode")]
+pub const PROMPT_PAUSED: &str = "* PAUSED, press any key to continue...";
+#[cfg(feature = "directmode")]
+pub const ERASE_START: &str = "\r\t\t\t\t\t\t\t\t\t\r";
+#[cfg(feature = "directmode")]
+pub const ERASE_PAUSED: &str = "\r\t\t\t\t\t\t\t\t\r";
 
 /// The bracketed values on the help screen: the filter settings in force, so
 /// `csw -fo4 -fh300` shows order 4 and a 300 Hz upper cutoff. Frequencies and
@@ -92,6 +149,11 @@ impl Console {
         } else {
             &[BULLET_CP437]
         }
+    }
+
+    #[cfg(feature = "directmode")]
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
     }
 
     /// The banner, printed before anything else, the help screen included.
@@ -229,8 +291,8 @@ impl Console {
         pulses: usize,
         orig_bytes: u64,
     ) -> io::Result<()> {
-        // An input of no size divides by nothing, which prints as
-        // "-Inf% (0:1)".
+        // A DirectMode recording has no original size: the division by
+        // nothing prints as "-Inf% (0:1)".
         let (pct, ratio) = if orig_bytes > 0 {
             (
                 format!(
@@ -336,6 +398,228 @@ impl Console {
     pub fn warn_block(&self, w: &mut impl Write, msg: &str) -> io::Result<()> {
         write!(w, "\n{msg}\n")
     }
+}
+
+/// DirectMode's console output, compiled in with the `directmode` feature.
+#[cfg(feature = "directmode")]
+impl Console {
+    // --- DirectMode (-r) -----------------------------------------------------
+
+    /// `"■ Input device: '<name>' (<n> ch, <format>)."`
+    pub fn input_device(
+        &self,
+        w: &mut impl Write,
+        name: &str,
+        channels: u16,
+        format: &str,
+    ) -> io::Result<()> {
+        self.status(
+            w,
+            &format!("Input device: '{name}' ({channels} ch, {format})."),
+        )
+    }
+
+    /// "■ Operating in compatibility mode." -- `-c`: take the device's own
+    /// configuration, unnegotiated.
+    pub fn device_compat_mode(&self, w: &mut impl Write) -> io::Result<()> {
+        self.status(w, "Operating in compatibility mode.")
+    }
+
+    pub fn capture_rate(&self, w: &mut impl Write, rate: u32, asked: u32) -> io::Result<()> {
+        self.status(
+            w,
+            &format!("Sampling rate: {rate} Hz (rounded from: {asked} Hz)."),
+        )
+    }
+
+    /// `"■ Max recording time is MM:SS (<n> bytes)."` -- the limit is the `-t`
+    /// time here, the free disk space otherwise.
+    pub fn max_recording_time(&self, w: &mut impl Write, secs: f64, bytes: u64) -> io::Result<()> {
+        self.status(
+            w,
+            &format!(
+                "Max recording time is {} ({bytes} bytes).",
+                clock(secs as i64)
+            ),
+        )
+    }
+
+    /// The live meters, redrawn in place: the RMS bar, the clipping bar,
+    /// their readouts, and while recording the elapsed time and sample count.
+    /// `levels` is `None` while recording, when the bars are blanked and the
+    /// block keeps its height; the readouts are dropped when the window has
+    /// no room beside the bars.
+    pub fn meter(
+        &self,
+        w: &mut impl Write,
+        note: &str,
+        levels: Option<(f32, f32)>,
+        progress: Option<(f64, u64)>,
+    ) -> io::Result<()> {
+        self.meter_at(w, note, levels, progress, meter_layout())
+    }
+
+    fn meter_at(
+        &self,
+        w: &mut impl Write,
+        note: &str,
+        levels: Option<(f32, f32)>,
+        progress: Option<(f64, u64)>,
+        (width, labelled): (usize, bool),
+    ) -> io::Result<()> {
+        let scale = width as f32 / METER_CELLS as f32;
+
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(HIDE_CURSOR);
+        out.push(b'\r');
+        out.extend_from_slice(note.as_bytes());
+        out.extend_from_slice(ERASE_LINE);
+        out.extend_from_slice(b"\n");
+        match levels {
+            Some((rms_units, clipped)) => {
+                // Both lengths are truncated, not rounded.
+                let level = (rms_units * CELLS_PER_UNIT)
+                    .trunc()
+                    .clamp(0.0, METER_CELLS as f32);
+                let clip = (clipped.clamp(0.0, 1.0) * METER_CELLS as f32).trunc();
+                bar(&mut out, (level * scale) as usize, width, LEVEL_COLOUR);
+                if labelled {
+                    out.extend_from_slice(format!("  {:>10}", rms_db_label(rms_units)).as_bytes());
+                }
+                out.extend_from_slice(ERASE_LINE);
+                out.extend_from_slice(b"\n");
+                bar(&mut out, (clip * scale) as usize, width, CLIP_COLOUR);
+                if labelled {
+                    out.extend_from_slice(
+                        format!("  {:>10}", format!("{:.1}% clip", clipped * 100.0)).as_bytes(),
+                    );
+                }
+                out.extend_from_slice(ERASE_LINE);
+                out.extend_from_slice(b"\n\r");
+            }
+            None => {
+                out.extend_from_slice(b"\r");
+                out.extend_from_slice(ERASE_LINE);
+                out.extend_from_slice(b"\n\r");
+                out.extend_from_slice(ERASE_LINE);
+                out.extend_from_slice(b"\n\r");
+            }
+        }
+        if let Some((secs, samples)) = progress {
+            out.extend_from_slice(
+                format!(" {}  {samples} samples", clock(secs as u64 as i64)).as_bytes(),
+            );
+        }
+        out.extend_from_slice(ERASE_LINE);
+        out.extend_from_slice(CURSOR_TO_BLOCK_TOP);
+        w.write_all(&out)?;
+        w.flush()
+    }
+
+    pub fn transient(&self, w: &mut impl Write, text: &str) -> io::Result<()> {
+        write!(w, "{text}")?;
+        w.flush()
+    }
+
+    /// Erase the meter block before printing anything permanent, leaving the
+    /// cursor where the block began.
+    pub fn clear_transient(&self, w: &mut impl Write) -> io::Result<()> {
+        for i in 0..METER_LINES {
+            w.write_all(b"\r")?;
+            w.write_all(ERASE_LINE)?;
+            if i + 1 < METER_LINES {
+                w.write_all(b"\n")?;
+            }
+        }
+        w.write_all(b"\r")?;
+        w.write_all(CURSOR_TO_BLOCK_TOP)?;
+        w.write_all(SHOW_CURSOR)?;
+        w.flush()
+    }
+
+    pub fn recorded(&self, w: &mut impl Write, samples: u64, secs: f64) -> io::Result<()> {
+        self.status(
+            w,
+            &format!(
+                "Recorded {samples} samples in {}",
+                clock((secs + 0.5) as i64)
+            ),
+        )
+    }
+
+    /// `"■ Keeping samples in file \"<name>\""` -- `-k`.
+    pub fn keeping(&self, w: &mut impl Write, file: &[u8]) -> io::Result<()> {
+        let mut msg = b"Keeping samples in file \"".to_vec();
+        msg.extend_from_slice(file);
+        msg.push(b'"');
+        self.status_raw(w, &msg)
+    }
+
+    /// Dropped-sample warning: the DMA overrun.
+    pub fn overrun(&self, w: &mut impl Write, lost: u64) -> io::Result<()> {
+        writeln!(w, "WARNING: DMA buffer OVERRUN!!! Lost {lost} samples")
+    }
+
+    /// "WARNING: ..." for a recording the spool ended before the user did (a
+    /// full volume, most often). What was captured is kept and converted.
+    pub fn recording_cut_short(&self, w: &mut impl Write, reason: &str) -> io::Result<()> {
+        writeln!(
+            w,
+            "WARNING: the recording ended early: {reason}; keeping what was captured"
+        )
+    }
+}
+
+// --- volume meter ------------------------------------------------------------
+
+/// One bar: `filled` cells in `colour`, the rest blue, every cell the same
+/// glyph.
+#[cfg(feature = "directmode")]
+fn bar(out: &mut Vec<u8>, filled: usize, width: usize, colour: &[u8]) {
+    let filled = filled.min(width);
+    out.push(b'\r');
+    out.extend_from_slice(colour);
+    for _ in 0..filled {
+        out.extend_from_slice(CELL);
+    }
+    out.extend_from_slice(EMPTY_COLOUR);
+    for _ in filled..width {
+        out.extend_from_slice(CELL);
+    }
+    out.extend_from_slice(RESET_COLOUR);
+}
+
+/// How wide the bars are, and whether the window has room for the readouts
+/// beside them: 80 cells unless the window cannot hold them, the readouts
+/// going first. A window reporting no width is taken as 80 columns.
+#[cfg(feature = "directmode")]
+fn meter_layout() -> (usize, bool) {
+    layout_for(crate::term::width())
+}
+
+#[cfg(feature = "directmode")]
+fn layout_for(cols: Option<u16>) -> (usize, bool) {
+    let cols = cols
+        .map(|cols| cols as usize)
+        .filter(|&cols| cols > 0)
+        .unwrap_or(METER_CELLS);
+    if cols >= METER_CELLS + LABEL_COLUMNS {
+        (METER_CELLS, true)
+    } else {
+        (cols.min(METER_CELLS), false)
+    }
+}
+
+/// "-18.4 dB" for the level bar, relative to a full-scale square wave, or
+/// "-inf dB" for digital silence.
+#[cfg(feature = "directmode")]
+fn rms_db_label(rms_units: f32) -> String {
+    /// Full scale in the 8-bit domain the meter reads.
+    const FULL_SCALE: f32 = 127.0;
+    if rms_units <= 0.0 {
+        return "-inf dB".into();
+    }
+    format!("{:.1} dB", 20.0 * (rms_units / FULL_SCALE).min(1.0).log10())
 }
 
 // --- number formatting -------------------------------------------------------
@@ -542,6 +826,86 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "directmode")]
+    #[test]
+    fn the_directmode_lines_carry_their_framing() {
+        let ui = console();
+        let mut v = Vec::new();
+        ui.recording_cut_short(&mut v, "the disk filled").unwrap();
+        assert_eq!(
+            v,
+            b"WARNING: the recording ended early: the disk filled; keeping what was captured\n"
+                .to_vec()
+        );
+        v.clear();
+        ui.transient(&mut v, PROMPT_START).unwrap();
+        ui.transient(&mut v, ERASE_START).unwrap();
+        assert_eq!(
+            v,
+            b"* Press any key to start conversion when done with volume meter...\
+              \r\t\t\t\t\t\t\t\t\t\r"
+                .to_vec()
+        );
+        v.clear();
+        ui.transient(&mut v, ERASE_PAUSED).unwrap();
+        ui.transient(&mut v, PROMPT_PAUSED).unwrap();
+        ui.transient(&mut v, ERASE_PAUSED).unwrap();
+        assert_eq!(
+            v,
+            b"\r\t\t\t\t\t\t\t\t\r* PAUSED, press any key to continue...\
+              \r\t\t\t\t\t\t\t\t\r"
+                .to_vec()
+        );
+        v.clear();
+        ui.overrun(&mut v, 7).unwrap();
+        assert_eq!(
+            v,
+            b"WARNING: DMA buffer OVERRUN!!! Lost 7 samples\n".to_vec()
+        );
+        v.clear();
+        ui.capture_rate(&mut v, 45454, 44100).unwrap();
+        assert_eq!(
+            v,
+            b"\xfe Sampling rate: 45454 Hz (rounded from: 44100 Hz).\n".to_vec()
+        );
+        v.clear();
+        ui.capture_rate(&mut v, 8000, 8000).unwrap();
+        assert_eq!(
+            v,
+            b"\xfe Sampling rate: 8000 Hz (rounded from: 8000 Hz).\n".to_vec()
+        );
+        v.clear();
+        ui.recorded(&mut v, 64516, 2.0).unwrap();
+        assert_eq!(v, b"\xfe Recorded 64516 samples in 00:02\n".to_vec());
+        v.clear();
+        ui.recorded(&mut v, 98304, 98304.0 / 32258.0).unwrap();
+        assert_eq!(v, b"\xfe Recorded 98304 samples in 00:03\n".to_vec());
+        v.clear();
+        ui.recorded(&mut v, 116128800, 3600.0).unwrap();
+        assert_eq!(v, b"\xfe Recorded 116128800 samples in 01:00:00\n".to_vec());
+    }
+
+    #[cfg(feature = "directmode")]
+    #[test]
+    fn the_limit_truncates_where_the_closing_line_rounds() {
+        let ui = console();
+        let mut v = Vec::new();
+        ui.max_recording_time(&mut v, 2.5, 80645).unwrap();
+        assert_eq!(
+            v,
+            b"\xfe Max recording time is 00:02 (80645 bytes).\n".to_vec()
+        );
+        v.clear();
+        ui.recorded(&mut v, 80645, 2.5).unwrap();
+        assert_eq!(v, b"\xfe Recorded 80645 samples in 00:03\n".to_vec());
+        v.clear();
+        ui.max_recording_time(&mut v, 31.855, 1027605).unwrap();
+        assert_eq!(
+            v,
+            b"\xfe Max recording time is 00:31 (1027605 bytes).\n".to_vec()
+        );
+    }
+
     #[test]
     fn banner_and_help_are_fixed_text() {
         let ui = console();
@@ -579,6 +943,10 @@ mod tests {
         // Only the bullet changes; the rest of the line is unchanged.
         assert!(terminal.ends_with(b" x\n"));
     }
+
+    /// Full-scale amplitude in the 8-bit domain the meter is fed in.
+    #[cfg(feature = "directmode")]
+    const FULL_SCALE_UNITS: f32 = 127.0;
 
     /// The bracketed values in the help screen are the settings in force,
     /// not fixed text.
@@ -639,6 +1007,173 @@ mod tests {
         assert_eq!(fmt_ostream(1234567.0), "1.23457e+06");
         assert_eq!(fmt_ostream(0.00001), "1e-05");
         assert_eq!(fmt_ostream(0.0001), "0.0001");
+    }
+
+    /// Cells filled in `colour` on one meter line: the run between that colour
+    /// and the blue the remainder is painted in.
+    #[cfg(feature = "directmode")]
+    fn filled(line: &str, colour: &[u8]) -> usize {
+        let colour = std::str::from_utf8(colour).unwrap();
+        line.split(colour)
+            .nth(1)
+            .and_then(|rest| rest.split('\u{1b}').next())
+            .map_or(0, |run| run.chars().filter(|&c| c == '\u{25A0}').count())
+    }
+
+    #[cfg(feature = "directmode")]
+    #[test]
+    fn the_meter_block_reanchors_after_every_newline() {
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        for (levels, layout) in [
+            (Some((FULL_SCALE_UNITS / 2.0, 0.25)), (METER_CELLS, false)),
+            (Some((FULL_SCALE_UNITS / 2.0, 0.25)), (METER_CELLS, true)),
+            (None, (METER_CELLS, false)),
+        ] {
+            let mut v = Vec::new();
+            console()
+                .meter_at(&mut v, PROMPT_START, levels, Some((1.0, 48000)), layout)
+                .unwrap();
+            blocks.push(v);
+        }
+        let mut v = Vec::new();
+        console().clear_transient(&mut v).unwrap();
+        blocks.push(v);
+        for bytes in blocks {
+            let head = bytes.strip_prefix(HIDE_CURSOR).unwrap_or(&bytes);
+            assert_eq!(
+                head.first(),
+                Some(&b'\r'),
+                "block does not re-anchor before its first glyph"
+            );
+            for (i, pair) in bytes.windows(2).enumerate() {
+                if pair[0] == b'\n' {
+                    assert_eq!(pair[1], b'\r', "newline at {i} does not re-anchor");
+                }
+            }
+        }
+    }
+
+    /// The meter is only ever drawn to a live terminal, so its bytes have to be
+    /// printable there: raw CP437 cells arrive as replacement characters on a
+    /// UTF-8 terminal.
+    #[cfg(feature = "directmode")]
+    #[test]
+    fn meter_bars_are_printable_on_a_utf8_terminal() {
+        let mut v = Vec::new();
+        console()
+            .meter_at(
+                &mut v,
+                "",
+                Some((FULL_SCALE_UNITS / 2.0, 0.0)),
+                None,
+                (METER_CELLS, false),
+            )
+            .unwrap();
+        let s = std::str::from_utf8(&v).expect("meter is UTF-8");
+        assert!(s.contains('\u{25A0}'), "no cells: {s:?}");
+        // Every cell is the same glyph; the colour is what distinguishes.
+        let line = s.split('\n').nth(1).unwrap();
+        assert!(filled(line, LEVEL_COLOUR) > 0, "no level cells: {line:?}");
+        assert!(filled(line, EMPTY_COLOUR) > 0, "no empty cells: {line:?}");
+    }
+
+    #[cfg(feature = "directmode")]
+    #[test]
+    fn the_layout_follows_the_window() {
+        for (cols, expected) in [
+            (None, (METER_CELLS, false)),
+            (Some(0), (METER_CELLS, false)),
+            (Some(1), (1, false)),
+            (Some(79), (79, false)),
+            (Some(80), (METER_CELLS, false)),
+            (Some(92), (METER_CELLS, false)),
+            (Some(93), (METER_CELLS, true)),
+            (Some(200), (METER_CELLS, true)),
+        ] {
+            assert_eq!(layout_for(cols), expected, "at {cols:?} columns");
+        }
+    }
+
+    #[cfg(feature = "directmode")]
+    #[test]
+    fn a_wide_window_gets_the_readouts() {
+        let mut v = Vec::new();
+        console()
+            .meter_at(
+                &mut v,
+                "",
+                Some((FULL_SCALE_UNITS / 2.0, 0.25)),
+                None,
+                (METER_CELLS, true),
+            )
+            .unwrap();
+        let wide = String::from_utf8(v).unwrap();
+        assert!(wide.contains(" dB"), "no level readout: {wide:?}");
+        assert!(wide.contains("% clip"), "no clipping readout: {wide:?}");
+        let mut v = Vec::new();
+        console()
+            .meter_at(
+                &mut v,
+                "",
+                Some((FULL_SCALE_UNITS / 2.0, 0.25)),
+                None,
+                (METER_CELLS, false),
+            )
+            .unwrap();
+        let narrow = String::from_utf8(v).unwrap();
+        assert!(!narrow.contains(" dB"), "readout on a narrow window");
+    }
+
+    /// The bar lengths: RMS times 0.625 cells, truncated, and the clipped
+    /// share of 80 cells, also truncated.
+    #[cfg(feature = "directmode")]
+    #[test]
+    fn bar_lengths_follow_the_meter_arithmetic() {
+        let cells = |rms: f32, clipped: f32| {
+            let mut v = Vec::new();
+            console()
+                .meter_at(&mut v, "", Some((rms, clipped)), None, (METER_CELLS, false))
+                .unwrap();
+            let s = String::from_utf8(v).unwrap();
+            // line 1 is the prompt; the bars are lines 2 and 3.
+            let mut lines = s.split('\n').skip(1);
+            let level = filled(lines.next().unwrap_or(""), LEVEL_COLOUR);
+            let clip = filled(lines.next().unwrap_or(""), CLIP_COLOUR);
+            (level, clip)
+        };
+        // A full-scale square wave fills the row: 127 * 0.625 = 79 cells.
+        assert_eq!(cells(FULL_SCALE_UNITS, 0.0).0, 79);
+        // A full-scale sine is 127/sqrt(2) -> 56 cells.
+        assert_eq!(cells(FULL_SCALE_UNITS / 2f32.sqrt(), 0.0).0, 56);
+        assert_eq!(cells(0.0, 0.0), (0, 0));
+        // Clipping: a quarter of the buffer railed is a quarter of the row.
+        assert_eq!(cells(0.0, 0.25).1, 20);
+        assert_eq!(cells(0.0, 1.0).1, METER_CELLS);
+    }
+
+    /// Blanked bars leave the block's height and its progress line alone;
+    /// this is what is drawn while recording.
+    #[cfg(feature = "directmode")]
+    #[test]
+    fn blank_bars_keep_the_block() {
+        let mut v = Vec::new();
+        console()
+            .meter_at(&mut v, "", None, Some((1.0, 48000)), (METER_CELLS, false))
+            .unwrap();
+        let s = String::from_utf8(v).unwrap();
+        assert!(!s.contains('\u{25A0}'), "bars drawn when blanked: {s:?}");
+        // The block keeps its height, and still reports progress.
+        assert_eq!(s.matches('\n').count(), METER_LINES - 1);
+        assert!(s.contains("48000 samples"), "{s:?}");
+    }
+
+    /// The readout beside the level bar reads in dB against full scale.
+    #[cfg(feature = "directmode")]
+    #[test]
+    fn level_readout_is_db_against_full_scale() {
+        assert_eq!(rms_db_label(FULL_SCALE_UNITS), "0.0 dB");
+        assert_eq!(rms_db_label(FULL_SCALE_UNITS / 2.0), "-6.0 dB");
+        assert_eq!(rms_db_label(0.0), "-inf dB");
     }
 
     #[test]
