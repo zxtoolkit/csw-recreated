@@ -4,7 +4,7 @@ use crate::signal::Pulses;
 
 /// The three passes a caller with a re-readable signal makes, made here over
 /// one buffer: probe, probe, run. [`crate::encode::PulseEncoder::run`] is the
-/// same loop against a file.
+/// same loop against a file or a spool.
 pub fn run_detector(bytes: &[u8]) -> (Vec<u32>, PulseDetector) {
     let mut det = PulseDetector::new();
     while !det.ready() {
@@ -84,8 +84,8 @@ struct Node {
     /// Level the current pulse starts from; 128 seeds it.
     last: u8,
     /// Samples of a reversal seen but not yet believed. This and `run` count
-    /// samples and are 64-bit: a flat input holds one pulse open for as long
-    /// as the input lasts.
+    /// samples and are 64-bit: a flat DirectMode input holds one pulse open
+    /// until the disk fills.
     pending: i64,
     /// The start-up counter, seeded -2: a call returns nothing until three
     /// emits have happened, and from then on the routine is two pulses
@@ -663,7 +663,7 @@ mod tests {
 
     /// The driver's three passes, with every pass -- probes included -- fed
     /// in pieces of `size`. `None` walks ragged boundaries instead, since a
-    /// streamed read is not a fixed size.
+    /// spool read is not a fixed size.
     fn detect_in_chunks(signal: &[u8], size: Option<usize>) -> Vec<u32> {
         // A fresh cut of the same signal for each pass: every pass restarts
         // at the first sample, and the ragged one has to restart its rhythm
@@ -722,8 +722,8 @@ mod tests {
         assert_eq!(detect_in_chunks(&signal, None), whole, "ragged chunks");
     }
 
-    /// Samples are quantised through this on their way to an 8-bit file, so
-    /// out-of-range samples have to clamp, not wrap.
+    /// The keep-file (`-k`) is quantised through this on its way out of the
+    /// recording spool, so out-of-range samples have to clamp, not wrap.
     #[test]
     fn byte_domain_quantises_and_clamps() {
         let got = to_byte_domain(&[-5.0, 0.0, 127.6, 128.0, 300.0], 128.0);

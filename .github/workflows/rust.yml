@@ -30,16 +30,24 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
+      # cpal needs ALSA's headers to build the DirectMode (-r) backend.
+      - name: Install ALSA development headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-      # The crate must still build without a C compiler: that is what
-      # `zlib-c` is for, and a target that has no C compiler at all
+      # The crate must still build where no audio stack is available -- and,
+      # with the default features off, without a C compiler either: that is
+      # what `zlib-c` is for, and a target that has no C compiler at all
       # (wasm32-unknown-unknown) can build nothing that links libz-sys.
       - run: cargo build --no-default-features
       # The suite too: the Z-RLE writer's refusal, and the tests that stand
       # down with it, are compiled in this configuration and no other.
       - run: cargo test --no-default-features
+      # Both backends at once, which is the configuration `src/audio.rs`
+      # promises builds on every platform.
+      - run: cargo build --all-features
       # `shell:` because the default on the Windows runner is pwsh, where
       # `! cmd` is no negation and grep need not be on PATH at all. Every
       # other multi-line `run:` here is guarded to Linux, so this is the one
@@ -49,6 +57,13 @@ jobs:
         run: |
           cargo tree --no-default-features --edges normal > deps.txt
           ! grep libz-sys deps.txt
+      # The raw-ALSA backend is Linux-only, and needs no libasound to build,
+      # to lint or to test -- which is the whole point of it.
+      - name: Check the raw-ALSA backend
+        if: runner.os == 'Linux'
+        run: |
+          cargo clippy --no-default-features --features record-alsa,zlib-c --all-targets -- -D warnings
+          cargo test --no-default-features --features record-alsa,zlib-c
 
   # `rust-version` in Cargo.toml is a promise to whoever builds this, and the
   # job above builds on stable, which is always newer. This is the one that
@@ -60,9 +75,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
         with:
           toolchain: "1.87"
+      - name: Install ALSA development headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo check --locked --all-targets
 
-  # A binary that depends on nothing, asserted rather than assumed.
+  # A DirectMode binary that depends on nothing: the reason the raw-ALSA
+  # backend exists, asserted rather than assumed.
   static:
     runs-on: ubuntu-latest
     steps:
@@ -74,19 +92,40 @@ jobs:
       # zlib is compiled in (libz-sys, vendored: the Z-RLE bytes are zlib's),
       # and compiling C for musl takes a musl C compiler. musl-tools' musl-gcc
       # is one; cc-rs is told about it through CC_<target>. It is the only C
-      # on this path.
+      # on this path: --no-default-features drops cpal and record-alsa is
+      # ioctl calls -- and it is asked for by name, because that same switch
+      # would otherwise drop `zlib-c` and with it the default Z-RLE output.
       - name: Install the musl C compiler
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: >
-          cargo build --release --target x86_64-unknown-linux-musl
+          cargo build --release --no-default-features --features record-alsa,zlib-c
+          --target x86_64-unknown-linux-musl
       - name: Confirm it links nothing
         run: |
           bin=target/x86_64-unknown-linux-musl/release/csw
           file "$bin"
           file "$bin" | grep -q static
           # ldd exits non-zero on a static binary, so its output is what is
-          # checked: no shared object at all.
+          # checked: no shared object at all, and libasound least of all.
           ! ldd "$bin" 2>&1 | grep -q '=>'
+          ! ldd "$bin" 2>&1 | grep -q asound
+      # The help screen is the MS-DOS converter's fixed text and lists -r
+      # whatever the crate was built with, so grepping it proves nothing.
+      # Asking for a recording does: a build without the feature refuses on
+      # the spot with the "DirectMode disabled" line from `encode_direct`,
+      # and a build with it reaches the backend, which on a runner with no
+      # soundcard fails with the "Unable to initialize soundcard" line. Both
+      # are asserted: an absence alone is satisfied by any other failure. The
+      # name carries no extension: one ending in .csw would decode instead of
+      # recording and never reach either line.
+      - name: Confirm DirectMode is compiled in
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/csw
+          "$bin" '-?' | grep -q -- '-r'
+          log=$("$bin" -r -t0.01 /tmp/directmode-probe 2>&1 || true)
+          echo "$log"
+          ! echo "$log" | grep -q 'DirectMode disabled'
+          echo "$log" | grep -q 'Unable to initialize soundcard'
