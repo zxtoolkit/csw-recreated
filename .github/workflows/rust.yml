@@ -1,0 +1,92 @@
+name: rust
+
+# The crate is the repository root, so the filter lists its entries rather
+# than one directory. A new top-level crate entry -- a benchmark directory, a
+# build script -- has to be added here; an allowlist that goes stale by
+# omission still beats a paths-ignore denylist that goes stale by inclusion.
+on:
+  push:
+    paths: ['src/**', 'tests/**', 'Cargo.toml', 'Cargo.lock',
+            'fixtures/**', '.github/workflows/rust.yml']
+  pull_request:
+    paths: ['src/**', 'tests/**', 'Cargo.toml', 'Cargo.lock',
+            'fixtures/**', '.github/workflows/rust.yml']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      # The crate must still build without a C compiler: that is what
+      # `zlib-c` is for, and a target that has no C compiler at all
+      # (wasm32-unknown-unknown) can build nothing that links libz-sys.
+      - run: cargo build --no-default-features
+      # The suite too: the Z-RLE writer's refusal, and the tests that stand
+      # down with it, are compiled in this configuration and no other.
+      - run: cargo test --no-default-features
+      # `shell:` because the default on the Windows runner is pwsh, where
+      # `! cmd` is no negation and grep need not be on PATH at all. Every
+      # other multi-line `run:` here is guarded to Linux, so this is the one
+      # step that had to say which shell it is written in.
+      - name: Confirm that build reaches no C zlib
+        shell: bash
+        run: |
+          cargo tree --no-default-features --edges normal > deps.txt
+          ! grep libz-sys deps.txt
+
+  # `rust-version` in Cargo.toml is a promise to whoever builds this, and the
+  # job above builds on stable, which is always newer. This is the one that
+  # holds the promise; raise both together or neither.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: "1.87"
+      - run: cargo check --locked --all-targets
+
+  # A binary that depends on nothing, asserted rather than assumed.
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      # zlib is compiled in (libz-sys, vendored: the Z-RLE bytes are zlib's),
+      # and compiling C for musl takes a musl C compiler. musl-tools' musl-gcc
+      # is one; cc-rs is told about it through CC_<target>. It is the only C
+      # on this path.
+      - name: Install the musl C compiler
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: >
+          cargo build --release --target x86_64-unknown-linux-musl
+      - name: Confirm it links nothing
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/csw
+          file "$bin"
+          file "$bin" | grep -q static
+          # ldd exits non-zero on a static binary, so its output is what is
+          # checked: no shared object at all.
+          ! ldd "$bin" 2>&1 | grep -q '=>'

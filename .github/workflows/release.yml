@@ -1,0 +1,559 @@
+name: release
+
+# WHAT THIS SHIPS: one archive per platform -- Windows, a universal macOS
+# build, and Linux x86_64 and aarch64 -- each holding a self-contained binary
+# with csw.html and wave.gif. Nothing here is
+# an installer or a package -- the audience for a tape converter is someone
+# who wants the file next to the tape deck to just run, on whatever machine
+# is next to the tape deck.
+#
+# "Self-contained" is a claim each job CHECKS rather than assumes: the static
+# Linux builds are verified to carry no NEEDED entries, the Windows .exe is
+# scanned for CRT imports, and the macOS binary is signed and then executed.
+# A build that quietly acquires a runtime dependency fails here rather than on
+# a user's machine.
+#
+# Every job also converts the two reference fixtures and publishes their hashes;
+# `verify-identical` fails unless every platform agrees, and the release is
+# gated on it. The encoder is integer work plus a handful of exact IEEE-754
+# operations, and rustc contracts nothing, so the platforms SHOULD agree
+# exactly -- which is what makes a disagreement worth failing on.
+
+# A RELEASE IS ALWAYS ASKED FOR. There is no `push` trigger: a tag, whatever
+# it is named, builds nothing on its own. The two ways to start a release are
+# publishing one from the release page and dispatching this workflow by hand,
+# both of which are somebody deciding to release.
+on:
+  release:
+    types: [published]
+  # So the packaging path is exercised before a release depends on it. A
+  # release workflow that only ever runs at release time breaks at release
+  # time.
+  pull_request:
+    paths: ['src/**', 'Cargo.toml', 'Cargo.lock', 'fixtures/**',
+            'docs/csw.html', 'docs/wave.gif',
+            '.github/workflows/release.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Stripped in CI ONLY, not in [profile.release]: a developer building this
+  # crate for themselves should keep their symbol table. Only the copy that
+  # ships loses it.
+  RUSTFLAGS: -C strip=symbols
+
+jobs:
+  linux:
+    name: linux-x86_64
+    # PINNED, deliberately not `ubuntu-latest`, so that this job and its
+    # aarch64 twin below sit on the same image and only their architecture
+    # differs.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+
+      # The build compiles one thing in C: zlib (libz-sys, vendored, because
+      # the Z-RLE bytes must be zlib's), and C for musl takes a musl C
+      # compiler -- musl-tools' musl-gcc, named to cc-rs through CC_<target>.
+      # That is the whole C toolchain the static build needs; Rust's
+      # self-contained musl linking does the rest.
+      - name: Install the musl C compiler
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build (static musl)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked
+             --target x86_64-unknown-linux-musl
+
+      - name: Stage and check
+        run: |
+          set -eu
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/csw dist/csw-linux-x86_64
+          chmod +x dist/*
+          echo "--- static build, which must need nothing ---"
+          file dist/csw-linux-x86_64
+          # readelf, not ldd: a static-pie binary makes ldd print "statically
+          # linked", which is also what ldd prints for things it declines to
+          # inspect. A NEEDED entry is the actual question.
+          if readelf -d dist/csw-linux-x86_64 | grep -q NEEDED; then
+            echo "::error::csw-linux-x86_64 has dynamic dependencies"
+            readelf -d dist/csw-linux-x86_64 | grep NEEDED
+            exit 1
+          fi
+          echo "no NEEDED entries"
+
+      - name: Convert the reference fixtures
+        run: |
+          set -eu
+          b=dist/csw-linux-x86_64
+          "./$b" fixtures/tone-8bit.wav tone.csw
+          "./$b" fixtures/square-8bit.wav square.csw
+          sha256sum tone.csw square.csw | tee "sha-$(basename "$b").txt"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: csw-linux-x86_64
+          path: |
+            dist/csw-linux-x86_64
+            sha-*.txt
+
+  # THE MACHINE THIS PROGRAM IS OFTEN ON. A cassette deck plugged into a Linux
+  # box is very often a Raspberry Pi, so aarch64 is not an exotic cell here --
+  # it is half the Linux audience. Otherwise this is the job above with its
+  # labels changed, on purpose: identical build commands mean a disagreement
+  # between the two binaries can never be blamed on the flags.
+  #   Pinned for the same reason its x86 twin is.
+  linux-arm:
+    name: linux-aarch64
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-musl
+
+      # As above: this runner is aarch64, so musl-tools' musl-gcc targets it.
+      - name: Install the musl C compiler
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build (static musl)
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked
+             --target aarch64-unknown-linux-musl
+
+      - name: Stage and check
+        run: |
+          set -eu
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-musl/release/csw dist/csw-linux-aarch64
+          chmod +x dist/*
+          echo "--- static build, which must need nothing ---"
+          file dist/csw-linux-aarch64
+          if readelf -d dist/csw-linux-aarch64 | grep -q NEEDED; then
+            echo "::error::csw-linux-aarch64 has dynamic dependencies"
+            readelf -d dist/csw-linux-aarch64 | grep NEEDED
+            exit 1
+          fi
+          echo "no NEEDED entries"
+
+      - name: Convert the reference fixtures
+        run: |
+          set -eu
+          b=dist/csw-linux-aarch64
+          "./$b" fixtures/tone-8bit.wav tone.csw
+          "./$b" fixtures/square-8bit.wav square.csw
+          sha256sum tone.csw square.csw | tee "sha-$(basename "$b").txt"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: csw-linux-aarch64
+          path: |
+            dist/csw-linux-aarch64
+            sha-*.txt
+
+  # ONE FILE FOR BOTH MACS. Intel and Apple Silicon in a single universal
+  # binary, so there is no architecture to pick on the download page -- the
+  # place a legacy audience most reliably picks wrong. macOS needs no static
+  # question: everything this binary calls is in the system.
+  macos:
+    name: macos-universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      # The deployment target is left at rustc's own default for each target
+      # (10.12 on x86_64), which is already older than any Mac likely to be
+      # running this.
+      - name: Build both slices
+        run: |
+          set -eu
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      # SIGNED, AND THEN RUN. An arm64 Mach-O must carry a valid signature or
+      # macOS kills it on launch with no diagnostic; rustc ad-hoc-signs the
+      # single-arch output, and re-signing after `lipo` is the cheap way to be
+      # certain the universal file inherited one. Nothing in CI opens this
+      # binary except the conversion step below -- which is exactly why that
+      # step is the real check that this asset launches at all.
+      - name: Make the universal binary
+        run: |
+          set -eu
+          mkdir -p dist
+          lipo -create -output dist/csw-macos-universal \
+            target/aarch64-apple-darwin/release/csw \
+            target/x86_64-apple-darwin/release/csw
+          codesign --force --sign - dist/csw-macos-universal
+          codesign -v dist/csw-macos-universal
+          lipo -info dist/csw-macos-universal
+          chmod +x dist/csw-macos-universal
+          echo "--- what it needs at runtime, all of it OS ---"
+          otool -L dist/csw-macos-universal
+
+      # The runner is arm64, so this exercises the arm64 slice. The x86_64
+      # slice is built and shipped but not executed here: there is no Rosetta
+      # on the arm64 runners.
+      - name: Convert the reference fixtures
+        run: |
+          set -eu
+          ./dist/csw-macos-universal fixtures/tone-8bit.wav tone.csw
+          ./dist/csw-macos-universal fixtures/square-8bit.wav square.csw
+          shasum -a 256 tone.csw square.csw | tee sha-csw-macos-universal.txt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: csw-macos-universal
+          path: |
+            dist/csw-macos-universal
+            sha-*.txt
+
+  windows:
+    name: windows-x86_64
+    runs-on: windows-latest
+    env:
+      # THE WHOLE "no installation" PROMISE ON WINDOWS. Rust's MSVC target
+      # links the C runtime dynamically by default, which means the .exe wants
+      # VCRUNTIME140.dll and dies on a machine that never had a Visual C++
+      # redistributable -- precisely the old machine this build exists for.
+      # +crt-static folds the runtime in. The scan below is what stops a lost
+      # flag from shipping quietly. This RESTATES the workflow's RUSTFLAGS
+      # rather than extending it -- a job-level `env` replaces the global one
+      # -- so `-C strip=symbols` is repeated here and a change to one must be
+      # made in both.
+      RUSTFLAGS: -C strip=symbols -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      # `--target` NAMES THE HOST ON PURPOSE, and dropping it breaks the
+      # build. RUSTFLAGS reaches build scripts and proc macros too when no
+      # target is given, and a proc macro is a dylib the compiler has to load
+      # -- it cannot be built against a static CRT. Naming the target confines
+      # +crt-static to the artifacts that ship. The tree pulls in
+      # windows-implement, windows-interface and document-features, so this is
+      # not hypothetical.
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Stage
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p dist
+          cp target/x86_64-pc-windows-msvc/release/csw.exe dist/csw-windows-x86_64.exe
+          ls -l dist
+
+      # A SCAN, not a link check, and it says so. `dumpbin` needs the VS
+      # developer environment set up around it and objdump is not on the
+      # runner; an import name, if present, is present as literal ASCII in the
+      # import directory, and its absence is the thing being asserted. A false
+      # pass would need the loader to find the CRT without naming it, which is
+      # not how PE imports work.
+      - name: Check the .exe imports no C runtime
+        shell: pwsh
+        run: |
+          $bytes = [IO.File]::ReadAllBytes('dist/csw-windows-x86_64.exe')
+          $text  = [Text.Encoding]::ASCII.GetString($bytes)
+          $hits  = @('VCRUNTIME140', 'MSVCP140', 'api-ms-win-crt', 'ucrtbase') |
+                   Where-Object { $text -match [regex]::Escape($_) }
+          if ($hits) {
+            Write-Output "::error::the .exe imports a C runtime: $($hits -join ', ') - the build lost +crt-static"
+            exit 1
+          }
+          Write-Output 'no C runtime imports'
+
+      - name: Convert the reference fixtures
+        shell: bash
+        run: |
+          set -eu
+          ./dist/csw-windows-x86_64.exe fixtures/tone-8bit.wav tone.csw
+          ./dist/csw-windows-x86_64.exe fixtures/square-8bit.wav square.csw
+          sha256sum tone.csw square.csw | tee sha-csw-windows-x86_64.txt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: csw-windows-x86_64
+          path: |
+            dist/csw-windows-x86_64.exe
+            sha-*.txt
+
+  # The point of having a matrix at all: every platform must write the same
+  # .csw, byte for byte. This is what would catch a width assumption that only
+  # bites on LLP64, or an arithmetic difference between arm64 and x86-64 -- both
+  # of which move the output by a byte or two and nothing else.
+  #   EVERY BUILD JOB MUST BE IN `needs`. This step compares whatever artifacts
+  # happen to exist when it downloads, so a job left out does not fail the
+  # gate: it silently drops out of it, and the remaining hashes agree.
+  verify-identical:
+    name: byte-exactness across platforms
+    needs: [linux, linux-arm, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: art
+
+      # Each sha file holds two lines -- tone and square -- so a binary that
+      # got one right and the other wrong still shows up. They are folded to a
+      # single comma-joined string per binary so `sort -u` can count distinct
+      # answers, with \r stripped because one of these was written by a shell
+      # on Windows.
+      - name: Compare output hashes
+        run: |
+          set -eu
+          files=$(find art -name 'sha-*.txt' | sort)
+          {
+            echo "| binary | tone.csw, square.csw |"
+            echo "|---|---|"
+            for f in $files; do
+              name=$(basename "$f" .txt); name=${name#sha-}
+              echo "| $name | \`$(tr -d '\r' < "$f" | awk '{print $1}' | paste -sd, -)\` |"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          answers=$(for f in $files; do
+            tr -d '\r' < "$f" | awk '{print $1}' | paste -sd, -
+          done | sort -u)
+          count=$(printf '%s\n' "$answers" | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::platforms disagree on .csw output - $count distinct answers"
+            exit 1
+          fi
+          echo "all platforms agree"
+
+  package:
+    name: archives
+    needs: [verify-identical]
+    runs-on: ubuntu-latest
+    steps:
+      # for docs/csw.html and docs/wave.gif
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: art
+
+      - name: Build one archive per platform
+        run: |
+          set -eu
+          case "$GITHUB_REF" in
+            refs/tags/*) ver="$GITHUB_REF_NAME" ;;
+            *)           ver=v0.0.0-dev ;;
+          esac
+
+          # Every timestamp is the tagged commit's, tar sorts and zeroes the
+          # ownership, gzip records neither name nor time: re-running a tag
+          # produces the same bytes, which SHA256SUMS covers.
+          epoch=$(git log -1 --format=%ct)
+
+          mkdir -p bin pkg
+          find art -type f -name 'csw-*' ! -name '*.txt' -exec cp {} bin/ \;
+
+          # $1 the staged binary, $2 what it is called inside, $3 zip or tar.
+          pack() {
+            rm -rf stage; mkdir stage
+            cp "bin/$1" "stage/$2"
+            cp docs/csw.html docs/wave.gif stage/
+            chmod +x "stage/$2"
+            touch -d "@$epoch" "stage/$2" stage/csw.html stage/wave.gif
+            plat=${1#csw-}; plat=${plat%.exe}
+            case "$3" in
+              zip) (cd stage && zip -X -9 -q "../pkg/csw-$ver-$plat.zip" \
+                                  "$2" csw.html wave.gif) ;;
+              tar) tar --sort=name --owner=0 --group=0 --numeric-owner \
+                       --mtime="@$epoch" -cf - -C stage "$2" csw.html wave.gif |
+                   gzip -9n > "pkg/csw-$ver-$plat.tar.gz" ;;
+            esac
+          }
+
+          pack csw-windows-x86_64.exe  csw.exe zip
+          pack csw-macos-universal     csw     zip
+          pack csw-linux-x86_64        csw     tar
+          pack csw-linux-aarch64       csw     tar
+          ls -l pkg
+
+      # Three files, the program among them, and no directory to descend into.
+      # The summary is written after the checks and not piped through tee,
+      # whose exit status would swallow theirs.
+      - name: Check the archives
+        run: |
+          set -eu
+          : > archives.md
+          { echo "### Archives"; echo; } >> archives.md
+          for a in pkg/*; do
+            case "$a" in
+              *.zip)    listing=$(unzip -Z1 "$a") ;;
+              *.tar.gz) listing=$(tar -tzf "$a") ;;
+            esac
+            { echo "\`$(basename "$a")\` -- $(echo "$listing" | paste -sd' ' -)"
+              echo; } >> archives.md
+            n=$(echo "$listing" | wc -l)
+            [ "$n" -eq 3 ] || { echo "::error::$a holds $n entries, not 3"; exit 1; }
+            for want in 'csw\(\.exe\)\?' 'csw\.html' 'wave\.gif'; do
+              echo "$listing" | grep -qx "$want" ||
+                { echo "::error::$a does not hold $want"; exit 1; }
+            done
+            case "$listing" in
+              */*) echo "::error::$a has a directory in it"; exit 1 ;;
+            esac
+          done
+          cat archives.md
+          cat archives.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: csw-archives
+          path: pkg/*
+
+  release:
+    name: attach binaries to release
+    # A published release runs with `github.ref` set to its tag, and so does
+    # a dispatch made against one. A dispatch against a branch has no version
+    # to attach anything to, and stops here having built and checked the
+    # archives.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [package]
+    runs-on: ubuntu-latest
+    # contents: write attaches the assets; the other two are what signs for
+    # them. Provenance is minted against this workflow's identity, so it can
+    # only be issued by the job that builds the release -- there is no way to
+    # add it afterwards.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: art
+
+      - name: Collect the assets
+        run: |
+          set -eu
+          mkdir -p rel
+          find art -type f \( -name '*.zip' -o -name '*.tar.gz' \) \
+               -exec cp {} rel/ \;
+          ls -l rel
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # `--generate-notes` produces a commit list, and gh prepends
+          # `--notes` to it, so this lands at the top of the page where
+          # somebody is choosing a download. Written whenever this job
+          # creates the release, and installed after the fact when the release
+          # page left the body empty; a body somebody wrote is theirs.
+          #   Written to a file: a heredoc nested inside `$( )` is parsed for
+          # the closing paren, and an apostrophe in the prose breaks it. The
+          # heredoc is quoted, so the tag goes in after it.
+          cat > release-notes.md <<'NOTES'
+          ### Install
+
+          **Windows**
+
+          1. Download **csw-VERSION-windows-x86_64.zip**
+          2. Extract the zip
+          3. Run `csw.exe` in your terminal
+
+          **macOS** (Intel and Apple Silicon)
+
+          1. Download **csw-VERSION-macos-universal.zip**
+          2. Extract the zip
+          3. Run `xattr -c csw` (to avoid the "unknown developer" warning)
+          4. Run `./csw`
+
+          **Linux**
+
+          1. Download **csw-VERSION-linux-x86_64.tar.gz** (or
+             **csw-VERSION-linux-aarch64.tar.gz**)
+          2. Extract: `tar xzvf csw-VERSION-linux-x86_64.tar.gz`
+          3. Run `./csw`
+          NOTES
+          sed -i "s|VERSION|$GITHUB_REF_NAME|g" release-notes.md
+
+          # CREATE ONLY IF ABSENT, and never with a bare `|| true`, which
+          # swallows a genuine failure alongside the expected "already
+          # exists". A release object exists already whenever the release was
+          # published from the release page, which is the usual way in.
+          #   `--prerelease` follows the TAG, not whoever typed the commands:
+          # without it a pre-release tag whose release object this job creates
+          # comes out as a full release.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists - uploading into it"
+            # PUBLISHED FROM THE RELEASE PAGE, where the body is a free text
+            # box that can be left blank. An empty one gets the install steps
+            # above; anything at all in it is somebody's writing and stands.
+            # `gh release edit` takes no --generate-notes, so the commit list
+            # the create path appends is not part of this.
+            body=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                     --json body --jq .body)
+            if [ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
+              gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                --notes-file release-notes.md
+              echo "the body was empty - installed the release notes"
+            fi
+          else
+            # A hyphen marks a pre-release, but the -rN revision is not one.
+            case "${GITHUB_REF_NAME%-r[0-9]*}" in
+              *-*) pre=--prerelease ;;
+              *)   pre= ;;
+            esac
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" --notes "$(cat release-notes.md)" \
+              --generate-notes $pre
+          fi
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber rel/*
+
+      # WHAT A DOWNLOADER CAN CHECK. For a program whose whole claim is that
+      # its output is byte-exact, publishing no hash of the binary making that
+      # claim would be an odd omission. `rel/` is what was actually attached,
+      # so what is hashed is those exact files.
+      - name: Publish SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          (cd rel && sha256sum *) > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber SHA256SUMS
+
+      # The signed half. A checksum file attached beside the binaries proves
+      # only that whoever wrote one wrote the other; provenance says WHICH run,
+      # from WHICH source revision, produced these exact bytes -- verifiable
+      # with `gh attestation verify <file> --repo <owner>/<repo>`.
+      #   GATED ON VISIBILITY, because the API refuses it otherwise:
+      # attestations cannot be persisted for a user-owned PRIVATE repository,
+      # and the action fails the release rather than degrading.
+      - name: Attest build provenance
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: 'rel/*'
+
+      # A SKIPPED STEP IS SILENT, and silence here reads exactly like a signed
+      # release. This says which half of the pair the release actually got.
+      - name: Note the absence of provenance
+        if: github.event.repository.visibility != 'public'
+        run: |
+          echo "SHA256SUMS attached. NO build-provenance attestation: this repository is" \
+               "${{ github.event.repository.visibility }}, and attestations are not available" \
+               "for user-owned private repositories." | tee -a "$GITHUB_STEP_SUMMARY"

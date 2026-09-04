@@ -1,0 +1,39 @@
+[package]
+name = "csw"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.87"
+license = "GPL-2.0-or-later"
+description = "Compressed Square Wave (CSW) tape-image converter: WAV/VOC/IFF/8SVX/OUT to CSW, and CSW back to WAV or VOC"
+
+[features]
+default = ["zlib-c"]
+# The Z-RLE writer's deflate: zlib's own, in C, vendored (see the dependency
+# note below). Off, the crate needs no C compiler; it reads both compressions
+# and writes `-z` and `-1`, and refuses the default Z-RLE output. On by
+# default, so a build that drops the default features and writes that output
+# names it:
+#   cargo build --release --no-default-features --features zlib-c
+zlib-c = ["dep:libz-sys", "flate2/zlib"]
+
+[dependencies]
+# Z-RLE (CSW v2): zlib-wrapped deflate, written by zlib itself, vendored and
+# linked statically. A deflate stream is not canonical -- every encoder packs
+# the same input differently -- and the bytes here must be zlib's at memory
+# level 9, not the default 8, which changes the stream past 16384 literals.
+# `container::zlib_deflate` calls `deflateInit2_` through `libz-sys`; flate2
+# keeps the inflate side, which any conforming implementation does, and so
+# keeps a Rust backend for builds without `zlib-c`, using the C one when
+# `zlib-c` is on.
+flate2 = { version = "1.1", default-features = false, features = [
+    "rust_backend",
+] }
+libz-sys = { version = "1", default-features = false, features = [
+    "static",
+], optional = true }
+[profile.release]
+opt-level = 3
+lto = true
+# Unwind tables and landing pads dropped: no Drop runs on the way out of a
+# panic. Nothing here calls catch_unwind.
+panic = "abort"
